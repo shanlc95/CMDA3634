@@ -1,0 +1,9 @@
+$Size
+10 10
+$Updates
+3
+$Alive
+3
+5 5
+6 5
+7 5

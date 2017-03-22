@@ -12,6 +12,8 @@ void mpiPrintBoard(int, int, int,int, int *);
 void updateBoard(int, int, int *, int *);
 int *mpiGameSetup(int, int, int *, int *, int *, FILE *);
 void haloExchange(int, int, int, int, int *);
+  
+int globalSumStateChanges = 0;
 
 int getHowManyRows(int rank, int size, int N) {
   // this function computes the number of rows a proces with rank "rank"
@@ -24,7 +26,7 @@ int getHowManyRows(int rank, int size, int N) {
 }
 
 int main(int argc, char **argv) {
-  
+
   /* Q2 b): use MPI_Init to initialize MPI */
   MPI_Init(&argc, &argv);
   /* Q2 b) code ends here */
@@ -43,7 +45,7 @@ int main(int argc, char **argv) {
   // argv[1] is the name of the file we are running
   // compile:  mpicc main.c -o gameOfLife
   // run:  mpirun -n NUMBER_OF_PROCESSES ./gameOfLife inputFile.tx
-  
+
   // open file for reading
   FILE *fp = fopen(argv[1], "r");
   
@@ -57,9 +59,9 @@ int main(int argc, char **argv) {
   int *boardB = (int *)calloc((Nlocal + 2) * (M + 2), sizeof(int));
   // Print Initial Board
   if (rank == 0) {
-    //printf("Initial condition\n\n");
+    printf("Initial condition\n\n");
   }
-  //mpiPrintBoard(N, M, rank, size, boardA);
+  mpiPrintBoard(N, M, rank, size, boardA);
    
   /* Initialize t1 and t2*/
   double t1 = 0;
@@ -82,11 +84,18 @@ int main(int argc, char **argv) {
     /* Q4 f) code ends here */
     updateBoard(Nlocal, M, boardA, boardB);
     
+    if (globalSumStateChanges == 0) {
+      if (rank == 0) {
+        printf("The board has reached a steady state.\r\n");
+      }
+      break;
+    }
+
     /* Q5 c): call mpiPrintBoard to print the local board  */
     if (rank == 0) {
-      //printf("After %d iterations\n", t);
+      printf("After %d iterations\n", t);
     }
-    //mpiPrintBoard(N, M, rank, size, boardB);
+    mpiPrintBoard(N, M, rank, size, boardB);
     /* Q5 c) code ends here */
     
     if (t == T)
@@ -101,10 +110,10 @@ int main(int argc, char **argv) {
     updateBoard(Nlocal, M, boardB, boardA);
     /* Q5 c): call mpiPrintBoard to print the local board*/
     if (rank == 0) {
-      //printf("After %d iterations\n", t);
+      printf("After %d iterations\n", t);
     }
     
-    //mpiPrintBoard(N, M, rank, size, boardA);
+    mpiPrintBoard(N, M, rank, size, boardA);
     /* Q5 c) code ends here */
   }
   
@@ -112,7 +121,7 @@ int main(int argc, char **argv) {
   t2 = MPI_Wtime();
 
   /* Print the elapsed time*/
-  printf("Elapsed time is %f\n", t2 - t1 ); 
+  //printf("Elapsed time is %f\n", t2 - t1 ); 
 
   // Finish
   free(boardA);
@@ -121,6 +130,7 @@ int main(int argc, char **argv) {
   /* Q2 d): use MPI_Finalize to finalize MPI */
   MPI_Finalize();
   /* Q2 d) code ends here */
+
   return (0);
 
 }
@@ -329,6 +339,10 @@ void haloExchange(int N, int M, int rank, int size, int *board) {
 // HW02 functions
 void updateBoard(int N, int M, int *oldBoard, int *newBoard) {
   // Update the board
+
+  // 2a)
+  int sumStateChanges = 0;
+
   for (int i = 1; i < N + 1; ++i) { // starting at 1 to skip boundary layer
     for (int j = 1; j < M + 1; ++j) { // starting at 1 to skip boundary layer
       
@@ -379,11 +393,19 @@ void updateBoard(int N, int M, int *oldBoard, int *newBoard) {
           newState = 0;
         }
       }
-      
+
       // Update new board
       newBoard[cell] = newState;
+
+      if (oldState != newState) {
+        sumStateChanges = sumStateChanges + 1;
+      }
+
     }
   }
+
+  MPI_Allreduce(&sumStateChanges, &globalSumStateChanges, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+
 }
 void printBoard(int N, int M, int *board) {
   // this is a reference serial version
