@@ -1,0 +1,410 @@
+/*THIS IS SHELL CODE
+compile with nvcc -Xcompiler -fopenmp -o cudaGOLShell cudaGOLShell.cu  -arch=sm_20
+run with ./cudaGOLShell boardfile.txt
+NOTE: fixed printing for non-square boards.
+*/
+// libraries
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <omp.h>
+#include <cuda.h>
+/*
+Put #define statements here 
+*/
+#define Thread 10
+
+// function prototypes
+void printBoard(int, int, int* );
+void updateBoard(int, int, int*, int*);
+
+/*Q1: put your cudaUpdateBoard kernel here*/
+
+__global__ void cudaUpdateBoard(const int N, const int M, int* oldBoard, int* newBoard) {
+
+int n = threadIdx.x + blockDim.x*blockIdx.x;
+int m = threadIdx.y + blockDim.y*blockIdx.y;
+
+// Declare variables
+
+int cell, cellBelow, cellAbove;
+int sum, sumBelow, sumLevel, sumAbove;
+int oldState, newState;
+
+  // Make useful indices
+  cell = m+n*(M+2); // Current cell
+  cellBelow = m+(n-1)*(M+2); // Cell below it
+  cellAbove = m+(n+1)*(M+2); // Cell above it
+      
+  // Split the sum into the 3 above, 3 below, and 2 level neighbors
+  sumBelow = oldBoard[cellBelow]+oldBoard[cellBelow-1]+oldBoard[cellBelow+1];
+  sumLevel = oldBoard[cell-1]+oldBoard[cell+1];
+  sumAbove = oldBoard[cellAbove]+oldBoard[cellAbove-1]+oldBoard[cellAbove+1];
+      
+  // Compute the sum
+  sum = sumBelow + sumLevel + sumAbove;
+      
+      
+  // Get the current state of the cell
+  oldState = oldBoard[cell];
+      
+  // Game of life rules:
+  // If the cell was alive
+  if(oldState == 1){
+        
+    // Exactly 2 or 3 neighbors
+    if(sum == 2||sum == 3){
+      newState = 1;
+    }
+        
+    // More then 3 or less then 2 neighbors
+    else{
+      newState = 0;
+    }
+  }
+      
+  // If the cell was dead
+  else{
+        
+    // Exactly 3 neighbors
+    if(sum == 3){
+      newState = 1;
+    }
+        
+    else{
+      newState = 0;
+    }
+  }
+      
+  // Update new board
+  newBoard[cell] = newState;
+      
+  //
+}
+
+/*Q2: put your cudaUpdateChecker kernel here*/
+
+__global__ void cudaUpdateChecker(int N, int M,
+								  int * newBoard, 
+								  int * oldBoard,
+								  int *partialSums) {
+
+// find rank of thread in thread-block
+  int t = threadIdx.x;
+  
+  // find block index
+  int b = blockIdx.x;
+
+  // find block Dimension
+  int d = blockDim.x;
+
+  // turn this into a linear index
+  int id = t + b*d;
+
+  // allocate enough shared memory for storing chunk of array
+  volatile __shared__ double shared[Thread];
+  
+  // load from global DEVICE memory to shared memory on DEVICE
+  shared[t] = 0;
+  if(id<(N+2)*(M+2)) 
+    shared[t] = 1;
+
+   // unrolled version of tree reduction, assumes 256 threads in thread-block
+ __syncthreads();
+
+  if(t<128) shared[t] += shared[t+128];
+  __syncthreads();
+
+  if(t< 64) shared[t] += shared[t+ 64];
+  __syncthreads();
+  
+  // intra "warp" synchronization means we do not need to barrier
+  if(t< 32) shared[t] += shared[t+ Thread/8];
+  if(t< 16) shared[t] += shared[t+ Thread/16];
+  if(t<  8) shared[t] += shared[t+ Thread/32];
+  if(t<  4) shared[t] += shared[t+ Thread/64];
+  if(t<  2) shared[t] += shared[t+ Thread/128];
+  if(t<  1) shared[t] += shared[t+ Thread/256];
+
+  if(t==0)
+    partialSums[b] = shared[t];
+
+}
+
+
+// main
+int main(int argc, char **argv){
+  
+  // Board dimensions
+  int N, M;
+  
+  // Read input file containing board information and number of iterations
+  FILE *fp = fopen(argv[1], "r");
+  
+  if(fp==NULL){
+    printf("Game Of Life: could not load input file %s\n", argv[1]);
+    exit(0);
+  }
+  // keep reading the file until you find $Size
+  char buf[BUFSIZ];
+  do{
+    fgets(buf, BUFSIZ, fp);
+  }while(!strstr(buf, "$Size"));
+  
+  // read the size
+  fgets(buf, BUFSIZ, fp);
+  sscanf(buf, "%d %d", &N, &M);
+  
+  // Initialize boards
+  int *boardA = (int*) calloc((N+2)*(M+2), sizeof(int));
+  int *boardB = (int*) calloc((N+2)*(M+2), sizeof(int));
+  int ii;
+  /* DO NOT REMOVE THIS PART */
+  for (ii=0; ii<(N+2)*(M+2); ii++){
+    boardA[ii] = 0;
+    boardB[ii] = 0;
+  }
+  
+  // Read number of updates
+  int T;
+  do{
+    fgets(buf, BUFSIZ, fp);
+  }while(!strstr(buf, "$Updates"));
+  fgets(buf, BUFSIZ, fp);
+  sscanf(buf, "%d", &T);
+  
+  printf("number of updates: %d\n", T);
+  int numAlive;
+  
+  // next, scan for how many alive cells you have
+  do{
+    fgets(buf, BUFSIZ, fp);
+  }while(!strstr(buf, "$Alive"));
+  
+  // read the number of alive cells
+  fgets(buf, BUFSIZ, fp);
+  sscanf(buf, "%d", &numAlive);
+  printf("initial number of alive cells:  %d \n", numAlive);
+  
+  //allocate the alive list (one list per every dimension
+  int * LiveList_i = (int*) calloc(numAlive, sizeof(int));
+  int * LiveList_j = (int*) calloc(numAlive, sizeof(int));
+  
+  for (int i=0; i<numAlive; i++){
+    fgets(buf, BUFSIZ, fp);
+    sscanf(buf, "%d %d", &LiveList_i[i], &LiveList_j[i]);
+  }
+  
+  fclose(fp);
+  // Spawn Cells
+  for(int n = 0; n<numAlive; ++n){
+    int i = LiveList_i[n]; int j = LiveList_j[n];
+    boardA[j+i*(M+2)] = 1;
+  }
+  free(LiveList_i);
+  free(LiveList_j);
+  
+  // Print Initial Board
+  printf("Initial Condition\n");
+  if ((N<=60) &&(M<=60)){
+    printBoard(N,M,boardA);
+  }
+
+  // Start Game
+  
+  /*Q1: create and allocate DEVICE boards A and B here */
+
+  int *oldBoard;
+  int *newBoard;
+  cudaMalloc(&oldBoard, (N+2)*(M+2)*sizeof(int));
+  cudaMalloc(&newBoard, (N+2)*(M+2)*sizeof(int));
+
+  /*Q1: copy boardA to DEVICE boards A here */
+
+  cudaMemcpy(oldBoard, boardA, (N+2)*(M+2)*(sizeof(int)), cudaMemcpyHostToDevice);
+  cudaMemcpy(newBoard, boardB, (N+2)*(M+2)*(sizeof(int)), cudaMemcpyHostToDevice);
+  
+  
+  int t = 0;
+  int changes = 0;
+  
+ /*Q1: set the number of blocks and threads here*/
+
+  dim3 numThreads(Thread,Thread);
+  dim3 numBlocks((N+Thread-1)/Thread, (N+Thread-1)/Thread);
+
+  /*Q2: set the number of blocks and threads here*/
+ 
+  /*Q2: create and allocate DEVICE boards for partial sums */
+
+  int *partialOld;
+  int *partialNew;
+  cudaMalloc(&partialOld, (N+2)*(M+2)*sizeof(int));
+  cudaMalloc(&partialNew, (N+2)*(M+2)*sizeof(int));
+
+  /*Q2: create and allocate HOST board for partial sums */
+
+  int *partialA;
+  int *partialB;
+  
+ 
+  // we time using OpenMP timing functions
+  double t1, t2;
+// REMEMBER TO TURN OFF ALL DISPLAY COMMANDS BEFORE TIMING!!! 
+t1= omp_get_wtime();
+
+  while(t<T){
+    
+    // Update boardA into boardB
+    /* Q1: replace this call with cudaUpdateBoard*/
+    cudaUpdateBoard <<<numBlocks,numThreads>>> (N, M, oldBoard, newBoard);
+    // check for changes
+    //cudaMemcpy(boardB, newBoard, (N+2)*(M+2)*(sizeof(int)), cudaMemcpyDeviceToHost);
+
+    /* Q2: call cudaUpdateChecker here*/
+ 
+   /* Q2: copy the partial DEVICE sum array to host here*/
+    
+    changes  = 0;
+   /* Q2: sum the entries of the partial sum array, check for if still life*/
+    //copy for display
+   
+    /* Q2: copy DEVICE board A to HOST boardA for display*/
+    // display if the board is small
+    //printf("updated, t = %d\n", t);
+    if ((N<=60) &&(M<=60)){
+      //printBoard(N,M,boardB);
+    }
+    if(t==T) break;
+   
+    ++t;
+    // Update boardB into boardA
+    /* Q1: replace this call with cudaUpdateBoard*/
+    cudaUpdateBoard <<<numBlocks,numThreads >>>(N, M, newBoard, oldBoard);
+    //cudaMemcpy(boardA, oldBoard, (N+2)*(M+2)*(sizeof(int)), cudaMemcpyDeviceToHost);
+
+    //check for changes
+   /* Q2: call cudaUpdateChecker here*/
+ 
+   /* Q2: copy the partial DEVICE sum array to host here*/
+    
+  /* Q2: sum the entries of the partial sum array, check for if still life*/
+    changes  = 0;
+  
+    //copy board for display
+    /* Q2: copy DEVICE board A to HOST boardA for display*/
+    //display board if small enough
+    //printf("updated, t = %d \n", t);
+    if ((N<=60) &&(M<=60)){
+      //printBoard(N,M,boardA);
+    }
+    
+    if(t==T) break;
+    //check for still-life
+   
+    ++t;
+    
+  }
+ t2 = omp_get_wtime();
+printf("it took %f seconds\n", t2-t1);  
+// Finish
+  free(boardA);
+  free(boardB);
+  
+  //free cuda variables
+  /*Q1 and Q2: free DEVICE variables using cudaFree*/
+  return(0);
+}
+
+void updateBoard(int N, int M,  int* oldBoard, int* newBoard){
+  
+  // Declare variables
+  int i, j;
+  int cell, cellBelow, cellAbove;
+  int sum, sumBelow, sumLevel, sumAbove;
+  int oldState, newState;
+  
+  for( i=1;i<N+1;++i){  //starting at 1 to skip boundary layer
+    for( j=1;j<M+1;++j){ //starting at 1 to skip boundary layer
+      
+      // Make useful indices
+      cell = j+i*(M+2); // Current cell
+      cellBelow = j+(i-1)*(M+2); // Cell below it
+      cellAbove = j+(i+1)*(M+2); // Cell above it
+      
+      // Split the sum into the 3 above, 3 below, and 2 level neighbors
+      sumBelow = oldBoard[cellBelow]+oldBoard[cellBelow-1]+oldBoard[cellBelow+1];
+      sumLevel = oldBoard[cell-1]+oldBoard[cell+1];
+      sumAbove = oldBoard[cellAbove]+oldBoard[cellAbove-1]+oldBoard[cellAbove+1];
+      
+      // Compute the sum
+      sum = sumBelow + sumLevel + sumAbove;
+      
+      
+      // Get the current state of the cell
+      oldState = oldBoard[cell];
+      
+      // Game of life rules:
+      // If the cell was alive
+      if(oldState == 1){
+        
+        // Exactly 2 or 3 neighbors
+        if(sum == 2||sum == 3){
+          newState = 1;
+        }
+        
+        // More then 3 or less then 2 neighbors
+        else{
+          newState = 0;
+        }
+      }
+      
+      // If the cell was dead
+      else{
+        
+        // Exactly 3 neighbors
+        if(sum == 3){
+          newState = 1;
+        }
+        
+        else{
+          newState = 0;
+        }
+      }
+      
+      // Update new board
+      newBoard[cell] = newState;
+      
+      //
+    }
+  }
+  
+}
+
+
+void printBoard(int N, int M, int* board){
+  
+  int i, j, cell, state;
+  //Formatted to start in top left corner, moving across each row
+  for(i=1;i<N+1;++i){
+    for(j=1;j<M+1;++j){ //starting at 1 to skip boundary layer
+      
+      // Cell number and state
+    
+      cell = j + i*(M+2);
+   //   printf("i= %d j = %d this is cell %d \n",i,j, cell );
+      state = board[cell];
+      
+      if(state == 1){
+        printf("X ");
+      }
+      
+      else{
+        printf(". ");
+      }
+      
+    }
+    printf("\n");
+  }
+}
+
